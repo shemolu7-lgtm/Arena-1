@@ -30,9 +30,9 @@ Search / engine features (aimed at strong club/expert level play)
     window, the rest with a fast zero-width "scout" window.
   - Iterative deepening with aspiration windows around the previous
     iteration's score.
-  - Transposition table (Zobrist/Polyglot hashing) storing depth, score,
-    bound type (exact / lower / upper) and best move, used both for
-    cutoffs and for move ordering.
+  - Memory-bounded, two-generation transposition table using fast native
+    bitboard position hashing. It stores depth, normalized mate score, bound
+    type (exact / lower / upper) and best move for cutoffs and move ordering.
   - Move ordering: TT move -> good captures via Static Exchange
     Evaluation (SEE) + MVV-LVA -> killer moves -> history heuristic ->
     remaining quiet moves.
@@ -77,10 +77,11 @@ move (10-60s+) to close more of that gap.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -102,6 +103,13 @@ INF: int = 30000
 MATE_VALUE: int = 29000
 MATE_THRESHOLD: int = MATE_VALUE - 1000
 MAX_PLY: int = 128
+TIME_CHECK_MASK: int = 127  # Check the deadline every 128 visited nodes.
+HISTORY_MAX: int = 75_000
+# A Python dict entry, integer key, score tuple, and move collectively use far
+# more than the raw payload size. This estimate keeps the user-facing TT size
+# close to its requested memory budget instead of potentially exceeding it by
+# an order of magnitude.
+ESTIMATED_TT_ENTRY_BYTES: int = 256
 
 EXACT: int = 0
 LOWER: int = 1  # fail-high (score is a lower bound)
@@ -178,6 +186,15 @@ ROOK_SEMI_OPEN_FILE_MG: int = 13
 KING_SHIELD_MG: int = 7
 
 TEMPO_BONUS: int = 9
+
+MOBILITY_WEIGHTS: Tuple[Tuple[int, int], ...] = (
+    (chess.KNIGHT, 4),
+    (chess.BISHOP, 4),
+    (chess.ROOK, 2),
+    (chess.QUEEN, 1),
+)
+WHITE_KING_SHIELD_RANKS: int = 0x0000000000FFFF00  # ranks two and three
+BLACK_KING_SHIELD_RANKS: int = 0x00FFFF0000000000  # ranks six and seven
 
 # --------------------------------------------------------------------------
 # Piece-square tables (White's perspective, a8=top-left reading order like a
@@ -388,66 +405,111 @@ def popcount(bb: int) -> int:
 # Static Exchange Evaluation (SEE)
 # --------------------------------------------------------------------------
 
+def _see_attacker_is_legal(
+    board: "chess.Board",
+    side: bool,
+    attacker_sq: int,
+    to_sq: int,
+    occupied: int,
+) -> bool:
+    """Return whether moving an SEE attacker leaves its own king safe.
+
+    SEE works on occupancy rather than by pushing moves.  Filtering pinned
+    pieces and defended king captures here avoids the most damaging errors of
+    pseudo-legal SEE while retaining the speed of bitboard exchange analysis.
+    The target bit is excluded from enemy piece sets because the original
+    occupant there has already been captured; the current exchange occupant is
+    represented by occupancy only.
+    """
+    king_sq = board.king(side)
+    if king_sq is None:
+        return True
+
+    occupied_after = occupied & ~(1 << attacker_sq)
+    if attacker_sq == king_sq:
+        king_sq = to_sq
+
+    enemy_attackers = board.attackers_mask(not side, king_sq, occupied_after)
+    enemy_attackers &= occupied_after & ~(1 << to_sq)
+    return not enemy_attackers
+
+
+def _least_valuable_legal_attacker(
+    board: "chess.Board", side: bool, to_sq: int, occupied: int
+) -> Tuple[Optional[int], Optional[int]]:
+    attackers = board.attackers_mask(side, to_sq, occupied) & occupied
+    if not attackers:
+        return None, None
+
+    for piece_type in PIECE_TYPES:
+        candidates = attackers & board.pieces_mask(piece_type, side)
+        while candidates:
+            attacker_bit = candidates & -candidates
+            attacker_sq = attacker_bit.bit_length() - 1
+            if _see_attacker_is_legal(board, side, attacker_sq, to_sq, occupied):
+                return attacker_sq, piece_type
+            candidates ^= attacker_bit
+    return None, None
+
+
 def static_exchange_eval(board: "chess.Board", move: "chess.Move") -> int:
-    """Approximate SEE: value (in centipawns, from the mover's point of
-    view) of the capture sequence that starts with `move` on its target
-    square, assuming both sides always recapture with their least
-    valuable attacker. Used for capture ordering and pruning."""
+    """Evaluate an exchange on ``move.to_square`` without mutating ``board``.
+
+    Both sides are assumed to use their least valuable legal recapture and may
+    decline an unfavorable continuation.  Promotions, en passant occupancy,
+    pins, and king captures are handled.  This occupancy-based implementation
+    is substantially faster than repeatedly pushing moves and cannot leave the
+    caller's board damaged if an unusual position is encountered.
+    """
     to_sq = move.to_square
     from_sq = move.from_square
-
-    if board.is_en_passant(move):
-        captured_value = SEE_VALUES[chess.PAWN]
-    else:
-        cap_pt = board.piece_type_at(to_sq)
-        if cap_pt is None:
-            return 0
-        captured_value = SEE_VALUES[cap_pt]
-
     moving_pt = board.piece_type_at(from_sq)
     if moving_pt is None:
         return 0
 
-    gains: List[int] = [captured_value]
-    board.push(move)
-    pushed = 1
-    try:
-        side = board.turn
-        last_value = SEE_VALUES[moving_pt]
-        depth = 0
+    is_en_passant = board.is_en_passant(move)
+    captured_pt = chess.PAWN if is_en_passant else board.piece_type_at(to_sq)
+    promotion_gain = 0
+    resulting_pt = moving_pt
+    if move.promotion is not None:
+        promotion_gain = SEE_VALUES[move.promotion] - SEE_VALUES[chess.PAWN]
+        resulting_pt = move.promotion
 
-        while depth < 32:
-            attackers = board.attackers(side, to_sq)
-            if not attackers:
-                break
-            least_sq: Optional[int] = None
-            least_val = INF
-            for s in attackers:
-                pt = board.piece_type_at(s)
-                if pt is None:
-                    continue
-                v = SEE_VALUES[pt]
-                if v < least_val:
-                    least_val = v
-                    least_sq = s
-            if least_sq is None:
-                break
+    # Quiet promotions still gain the promoted material even though they do
+    # not enter capture ordering at ordinary search nodes.
+    if captured_pt is None:
+        return promotion_gain
 
-            gains.append(last_value - gains[len(gains) - 1])
-            last_value = least_val
+    gains: List[int] = [SEE_VALUES[captured_pt] + promotion_gain]
+    occupied = board.occupied & ~(1 << from_sq)
+    if is_en_passant:
+        captured_sq = to_sq - 8 if board.turn == chess.WHITE else to_sq + 8
+        occupied &= ~(1 << captured_sq)
+    occupied |= 1 << to_sq
 
-            promo = None
-            if board.piece_type_at(least_sq) == chess.PAWN and chess.square_rank(to_sq) in (0, 7):
-                promo = chess.QUEEN
-            board.push(chess.Move(least_sq, to_sq, promotion=promo))
-            pushed += 1
-            side = board.turn
-            depth += 1
-    except Exception:
-        pass
-    finally:
-        for _ in range(pushed):
-            board.pop()
+    side = not board.turn
+    target_value = SEE_VALUES[resulting_pt]
+
+    for _ in range(31):
+        # A legal king capture cannot itself be recaptured.
+        if resulting_pt == chess.KING:
+            break
+
+        attacker_sq, attacker_pt = _least_valuable_legal_attacker(
+            board, side, to_sq, occupied
+        )
+        if attacker_sq is None or attacker_pt is None:
+            break
+
+        gains.append(target_value - gains[len(gains) - 1])
+        occupied &= ~(1 << attacker_sq)
+
+        if attacker_pt == chess.PAWN and chess.square_rank(to_sq) in (0, 7):
+            resulting_pt = chess.QUEEN
+        else:
+            resulting_pt = attacker_pt
+        target_value = SEE_VALUES[resulting_pt]
+        side = not side
 
     for i in range(len(gains) - 2, -1, -1):
         gains[i] = -max(-gains[i], gains[i + 1])
@@ -457,6 +519,51 @@ def static_exchange_eval(board: "chess.Board", move: "chess.Move") -> int:
 # --------------------------------------------------------------------------
 # Transposition table entry (plain tuple for speed): (depth, score, flag, move)
 # --------------------------------------------------------------------------
+
+def _position_key(board: "chess.Board") -> int:
+    """Build a fast native hash for all state relevant to the search.
+
+    ``chess.polyglot.zobrist_hash()`` walks every occupied square in Python and
+    was one of the engine's hottest operations.  Hashing python-chess's native
+    bitboards is over an order of magnitude faster.  The halfmove clock is
+    included so a TT result cannot cross-contaminate positions on opposite
+    sides of the fifty-move draw boundary.
+    """
+    return hash(
+        (
+            board.pawns,
+            board.knights,
+            board.bishops,
+            board.rooks,
+            board.queens,
+            board.kings,
+            board.occupied_co[chess.WHITE],
+            board.occupied_co[chess.BLACK],
+            board.turn,
+            board.castling_rights,
+            board.ep_square,
+            min(board.halfmove_clock, 100),
+        )
+    )
+
+
+def _score_to_tt(score: int, ply: int) -> int:
+    """Normalize mate scores before storage so they are root-independent."""
+    if score >= MATE_THRESHOLD:
+        return score + ply
+    if score <= -MATE_THRESHOLD:
+        return score - ply
+    return score
+
+
+def _score_from_tt(score: int, ply: int) -> int:
+    """Restore a normalized TT mate score at the current search ply."""
+    if score >= MATE_THRESHOLD:
+        return score - ply
+    if score <= -MATE_THRESHOLD:
+        return score + ply
+    return score
+
 
 class TimeUp(Exception):
     """Raised internally to unwind the search once the time budget is spent."""
@@ -472,7 +579,13 @@ class Engine:
     ) -> None:
         self.tt_current: Dict[int, Tuple[int, int, int, Optional[chess.Move]]] = {}
         self.tt_previous: Dict[int, Tuple[int, int, int, Optional[chess.Move]]] = {}
-        self.tt_max_entries: int = max(1, (tt_size_mb * 1024 * 1024) // 40)
+        requested_tt_bytes = max(1, tt_size_mb) * 1024 * 1024
+        self.tt_max_entries: int = max(
+            2, requested_tt_bytes // ESTIMATED_TT_ENTRY_BYTES
+        )
+        # Two equally bounded generations keep useful older entries while
+        # ensuring their combined size stays within the configured budget.
+        self.tt_generation_entries: int = max(1, self.tt_max_entries // 2)
         self.killers: List[List[Optional[chess.Move]]] = [[None, None] for _ in range(MAX_PLY)]
         self.history: Dict[Tuple[bool, int, int], int] = {}
         self.nodes: int = 0
@@ -505,6 +618,7 @@ class Engine:
             except Exception:
                 pass
             self.book_reader = None
+        self.book_loaded = False
 
     def get_book_move(self, board: "chess.Board") -> Optional["chess.Move"]:
         """Return a move sampled (weighted by book 'weight') from the
@@ -537,13 +651,13 @@ class Engine:
         # ---- material + piece-square tables ----
         for pt in PIECE_TYPES:
             bb_all = board.pieces_mask(pt, chess.WHITE)
-            for sq in chess.SquareSet(bb_all):
+            for sq in chess.scan_forward(bb_all):
                 mg_score += PIECE_VALUES_MG[pt] + PST_MG[pt][sq]
                 eg_score += PIECE_VALUES_EG[pt] + PST_EG[pt][sq]
                 phase += GAME_PHASE_INC[pt]
 
             bb_all = board.pieces_mask(pt, chess.BLACK)
-            for sq in chess.SquareSet(bb_all):
+            for sq in chess.scan_forward(bb_all):
                 msq = mirror(sq)
                 mg_score -= PIECE_VALUES_MG[pt] + PST_MG[pt][msq]
                 eg_score -= PIECE_VALUES_EG[pt] + PST_EG[pt][msq]
@@ -558,13 +672,13 @@ class Engine:
             eg_score -= BISHOP_PAIR_EG
 
         # ---- mobility (cheap bitboard-based approximation) ----
-        for pt, w in [(chess.KNIGHT, 4), (chess.BISHOP, 4), (chess.ROOK, 2), (chess.QUEEN, 1)]:
-            for sq in chess.SquareSet(board.pieces_mask(pt, chess.WHITE)):
+        for pt, w in MOBILITY_WEIGHTS:
+            for sq in chess.scan_forward(board.pieces_mask(pt, chess.WHITE)):
                 attacks = board.attacks_mask(sq)
                 mob = popcount(attacks & ~white_occ)
                 mg_score += mob * w
                 eg_score += mob * w
-            for sq in chess.SquareSet(board.pieces_mask(pt, chess.BLACK)):
+            for sq in chess.scan_forward(board.pieces_mask(pt, chess.BLACK)):
                 attacks = board.attacks_mask(sq)
                 mob = popcount(attacks & ~black_occ)
                 mg_score -= mob * w
@@ -592,13 +706,13 @@ class Engine:
                 mg_score += ISOLATED_PAWN_MG
                 eg_score += ISOLATED_PAWN_EG
 
-        for sq in chess.SquareSet(wp):
+        for sq in chess.scan_forward(wp):
             if (PASSED_MASK[chess.WHITE][sq] & bp) == 0:
                 rank = chess.square_rank(sq)
                 bonus = (rank - 1) * PASSED_PAWN_MG
                 mg_score += bonus
                 eg_score += bonus * 2
-        for sq in chess.SquareSet(bp):
+        for sq in chess.scan_forward(bp):
             if (PASSED_MASK[chess.BLACK][sq] & wp) == 0:
                 rank = 7 - chess.square_rank(sq)
                 bonus = (rank - 1) * PASSED_PAWN_MG
@@ -606,11 +720,11 @@ class Engine:
                 eg_score -= bonus * 2
 
         # ---- rooks on (semi-)open files ----
-        for sq in chess.SquareSet(board.rooks & white_occ):
+        for sq in chess.scan_forward(board.rooks & white_occ):
             f = chess.square_file(sq)
             if popcount(wp & FILE_MASK[f]) == 0:
                 mg_score += ROOK_OPEN_FILE_MG if popcount(bp & FILE_MASK[f]) == 0 else ROOK_SEMI_OPEN_FILE_MG
-        for sq in chess.SquareSet(board.rooks & black_occ):
+        for sq in chess.scan_forward(board.rooks & black_occ):
             f = chess.square_file(sq)
             if popcount(bp & FILE_MASK[f]) == 0:
                 mg_score -= ROOK_OPEN_FILE_MG if popcount(wp & FILE_MASK[f]) == 0 else ROOK_SEMI_OPEN_FILE_MG
@@ -623,7 +737,7 @@ class Engine:
             if wf <= 2 or wf >= 5:
                 shield = 0
                 for f in range(max(0, wf - 1), min(7, wf + 1) + 1):
-                    if wp & FILE_MASK[f] & 0xFFFF00:
+                    if wp & FILE_MASK[f] & WHITE_KING_SHIELD_RANKS:
                         shield += 1
                 mg_score += shield * KING_SHIELD_MG
         if bk is not None:
@@ -631,13 +745,19 @@ class Engine:
             if bf <= 2 or bf >= 5:
                 shield = 0
                 for f in range(max(0, bf - 1), min(7, bf + 1) + 1):
-                    if bp & FILE_MASK[f] & 0xFFFF00000000:
+                    if bp & FILE_MASK[f] & BLACK_KING_SHIELD_RANKS:
                         shield += 1
                 mg_score -= shield * KING_SHIELD_MG
 
         # ---- tapered blend ----
         phase = min(phase, TOTAL_PHASE)
-        score = (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) // TOTAL_PHASE
+        tapered = mg_score * phase + eg_score * (TOTAL_PHASE - phase)
+        # Explicit truncation toward zero keeps interpreted Python and Cython
+        # builds identical and preserves color symmetry for negative scores.
+        if tapered >= 0:
+            score = tapered // TOTAL_PHASE
+        else:
+            score = -((-tapered) // TOTAL_PHASE)
 
         stm_score = score if board.turn == chess.WHITE else -score
         stm_score += TEMPO_BONUS  # small tempo bonus for the side to move
@@ -650,66 +770,136 @@ class Engine:
         moves: List["chess.Move"],
         ply: int,
         tt_move: Optional["chess.Move"],
+        see_scores: Optional[Dict["chess.Move", int]] = None,
     ) -> List["chess.Move"]:
         scored: List[Tuple[int, chess.Move]] = []
         killer0, killer1 = self.killers[ply][0], self.killers[ply][1]
         opp_occ = board.occupied_co[not board.turn]
         for m in moves:
-            is_cap = bool(opp_occ & (1 << m.to_square)) or board.is_en_passant(m)
+            is_en_passant = board.is_en_passant(m)
+            is_cap = bool(opp_occ & (1 << m.to_square)) or is_en_passant
             if tt_move is not None and m == tt_move:
                 score = 1_000_000
             elif is_cap:
-                score = 100_000 + static_exchange_eval(board, m)
+                see = static_exchange_eval(board, m)
+                if see_scores is not None:
+                    see_scores[m] = see
+                victim_pt = (
+                    chess.PAWN if is_en_passant else board.piece_type_at(m.to_square)
+                )
+                attacker_pt = board.piece_type_at(m.from_square)
+                mvv_lva = (
+                    SEE_VALUES.get(victim_pt, 0) * 10
+                    - SEE_VALUES.get(attacker_pt, 0)
+                )
+                # Profitable exchanges lead all non-TT moves. Losing captures
+                # wait until after promotions and killers instead of consuming
+                # the most valuable alpha-beta slots.
+                if see >= 0:
+                    score = 100_000 + see + mvv_lva
+                else:
+                    score = 70_000 + see + mvv_lva
             elif m.promotion:
-                score = 90_000 + (SEE_VALUES.get(m.promotion, 0))
+                score = 90_000 + SEE_VALUES.get(m.promotion, 0)
             elif killer0 is not None and m == killer0:
                 score = 80_000
             elif killer1 is not None and m == killer1:
                 score = 79_000
             else:
-                score = self.history.get((board.turn, m.from_square, m.to_square), 0)
+                score = self.history.get(
+                    (board.turn, m.from_square, m.to_square), 0
+                )
             scored.append((score, m))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [m for _, m in scored]
 
     # -------------------------------------------------------- quiescence
-    def quiescence(self, board: "chess.Board", alpha: int, beta: int, ply: int) -> int:
-        self.nodes += 1
-        if self.nodes & 2047 == 0:
-            self._check_time()
+    def quiescence(
+        self,
+        board: "chess.Board",
+        alpha: int,
+        beta: int,
+        ply: int,
+        count_node: bool = True,
+    ) -> int:
+        # A depth-zero negamax node has already been counted; recursive qsearch
+        # calls have not. Avoid inflating node/NPS statistics at the boundary.
+        if count_node:
+            self.nodes += 1
+            if self.nodes & TIME_CHECK_MASK == 0:
+                self._check_time()
 
         in_check = board.is_check()
-        stand_pat = self.evaluate(board)
+        if count_node and ply > 0 and (
+            board.is_repetition(2)
+            or board.halfmove_clock >= 100
+            or board.is_insufficient_material()
+        ):
+            # Checkmate ends the game before a draw can be claimed.
+            if in_check and not any(board.generate_legal_moves()):
+                return -MATE_VALUE + ply
+            return 0
 
         if not in_check:
+            stand_pat = self.evaluate(board)
             if stand_pat >= beta:
                 return stand_pat
             if stand_pat > alpha:
                 alpha = stand_pat
             best = stand_pat
         else:
+            stand_pat = -INF
             best = -INF
 
         if ply >= MAX_PLY - 1:
-            return stand_pat
+            if in_check and not any(board.generate_legal_moves()):
+                return -MATE_VALUE + ply
+            if not in_check and board.is_stalemate():
+                return 0
+            return self.evaluate(board) if in_check else stand_pat
 
         opp_occ = board.occupied_co[not board.turn]
         if in_check:
             candidates = list(board.legal_moves)
+            if not candidates:
+                return -MATE_VALUE + ply
         else:
-            candidates = [m for m in board.legal_moves if bool(opp_occ & (1 << m.to_square)) or board.is_en_passant(m) or m.promotion]
+            candidates = []
+            has_legal_move = False
+            for m in board.legal_moves:
+                has_legal_move = True
+                if (
+                    bool(opp_occ & (1 << m.to_square))
+                    or board.is_en_passant(m)
+                    or m.promotion
+                ):
+                    candidates.append(m)
+            if not has_legal_move:
+                return 0  # stalemate
 
-        candidates = self.order_moves(board, candidates, min(ply, MAX_PLY - 1), None)
+        see_scores: Dict[chess.Move, int] = {}
+        candidates = self.order_moves(
+            board,
+            candidates,
+            min(ply, MAX_PLY - 1),
+            None,
+            see_scores=see_scores,
+        )
 
         for m in candidates:
             is_cap = bool(opp_occ & (1 << m.to_square)) or board.is_en_passant(m)
             if not in_check and is_cap:
-                # delta pruning + SEE pruning of clearly losing captures
-                see_val = static_exchange_eval(board, m)
+                # Never prune a forcing check or promotion solely because its
+                # material exchange looks unfavorable; either may be mate.
+                see_val = see_scores[m]
                 if see_val < 0:
-                    continue
-                if stand_pat + see_val + 130 < alpha:  # Calibrated down from 200
-
+                    if not m.promotion and not board.gives_check(m):
+                        continue
+                elif (
+                    not m.promotion
+                    and stand_pat + see_val + 130 < alpha
+                    and not board.gives_check(m)
+                ):
                     continue
 
             board.push(m)
@@ -738,36 +928,50 @@ class Engine:
         can_null: bool = True,
     ) -> int:
         self.nodes += 1
-        if self.nodes & 1023 == 0:
+        if self.nodes & TIME_CHECK_MASK == 0:
             self._check_time()
 
         pv_node = (beta - alpha) > 1
         alpha_orig = alpha
 
-        if ply > 0 and (board.is_repetition(2) or board.halfmove_clock >= 100 or
-                         board.is_insufficient_material()):
+        in_check = board.is_check()
+        if ply > 0 and (
+            board.is_repetition(2)
+            or board.halfmove_clock >= 100
+            or board.is_insufficient_material()
+        ):
+            # Checkmate takes precedence over a claimable draw.
+            if in_check and not any(board.generate_legal_moves()):
+                return -MATE_VALUE + ply
             return 0
 
         if ply >= MAX_PLY - 1:
+            if in_check and not any(board.generate_legal_moves()):
+                return -MATE_VALUE + ply
+            if not in_check and board.is_stalemate():
+                return 0
             return self.evaluate(board)
 
-        in_check = board.is_check()
         if in_check:
             depth += 1  # check extension
 
         if depth <= 0:
-            return self.quiescence(board, alpha, beta, ply)
+            return self.quiescence(board, alpha, beta, ply, count_node=False)
 
-        zkey = chess.polyglot.zobrist_hash(board)
+        zkey = _position_key(board)
         tt_entry = self.tt_current.get(zkey)
         if tt_entry is None:
             tt_entry = self.tt_previous.get(zkey)
-            if tt_entry is not None:
+            if (
+                tt_entry is not None
+                and len(self.tt_current) < self.tt_generation_entries
+            ):
                 self.tt_current[zkey] = tt_entry
 
         tt_move: Optional[chess.Move] = None
         if tt_entry is not None:
-            tt_depth, tt_score, tt_flag, tt_move = tt_entry
+            tt_depth, stored_score, tt_flag, tt_move = tt_entry
+            tt_score = _score_from_tt(stored_score, ply)
             if tt_depth >= depth and ply > 0:
                 if tt_flag == EXACT:
                     return tt_score
@@ -816,6 +1020,8 @@ class Engine:
 
         opp_occ = board.occupied_co[not board.turn]
         for m in ordered:
+            if ply == 0:
+                self._check_time()
             is_capture = bool(opp_occ & (1 << m.to_square)) or board.is_en_passant(m)
             gives_check = False
             if not is_capture and not m.promotion:
@@ -871,7 +1077,11 @@ class Engine:
                         self.killers[min(ply, MAX_PLY - 1)][1] = self.killers[min(ply, MAX_PLY - 1)][0]
                         self.killers[min(ply, MAX_PLY - 1)][0] = m
                     key = (board.turn, m.from_square, m.to_square)
-                    self.history[key] = self.history.get(key, 0) + depth * depth
+                    bonus = min(depth * depth, HISTORY_MAX // 4)
+                    old_history = self.history.get(key, 0)
+                    self.history[key] = old_history + bonus - (
+                        old_history * bonus // HISTORY_MAX
+                    )
                 break
 
         flag = EXACT
@@ -880,19 +1090,49 @@ class Engine:
         elif best_score >= beta:
             flag = LOWER
 
-        if len(self.tt_current) >= self.tt_max_entries:
-            self.tt_previous = self.tt_current
-            self.tt_current = {}
-        self.tt_current[zkey] = (depth, best_score, flag, best_move)
+        self._store_tt(zkey, depth, best_score, flag, best_move, ply)
 
         return best_score
+
+    def _store_tt(
+        self,
+        zkey: int,
+        depth: int,
+        score: int,
+        flag: int,
+        move: Optional["chess.Move"],
+        ply: int,
+    ) -> None:
+        """Store a depth-preferred entry in the bounded two-generation TT."""
+        current_entry = self.tt_current.get(zkey)
+        prior_entry = current_entry or self.tt_previous.get(zkey)
+        if prior_entry is not None:
+            prior_depth, _, prior_flag, _ = prior_entry
+            if prior_depth > depth and prior_flag == EXACT:
+                return
+            if prior_depth > depth + 1 and flag != EXACT:
+                return
+
+        if (
+            current_entry is None
+            and len(self.tt_current) >= self.tt_generation_entries
+        ):
+            self.tt_previous = self.tt_current
+            self.tt_current = {}
+
+        self.tt_current[zkey] = (
+            depth,
+            _score_to_tt(score, ply),
+            flag,
+            move,
+        )
 
     def _has_non_pawn_material(self, board: "chess.Board", color: bool) -> bool:
         occ = board.occupied_co[color]
         return bool(occ & (board.knights | board.bishops | board.rooks | board.queens))
 
     def _check_time(self) -> None:
-        if time.time() >= self.stop_time:
+        if time.monotonic() >= self.stop_time:
             raise TimeUp()
 
     # --------------------------------------------------------------- root
@@ -915,9 +1155,23 @@ class Engine:
             }
 
         self.nodes = 0
-        self.start_time = time.time()
-        self.stop_time = self.start_time + max(0.05, move_time)
+        self.start_time = time.monotonic()
+        try:
+            budget = float(move_time)
+        except (TypeError, ValueError):
+            budget = 0.001
+        if not math.isfinite(budget) or budget <= 0.0:
+            budget = 0.001
+        self.stop_time = self.start_time + budget
         self.killers = [[None, None] for _ in range(MAX_PLY)]
+        # Age history between moves so obsolete cutoffs do not permanently
+        # dominate ordering, while retaining useful information from the game.
+        if self.history:
+            self.history = {
+                key: min(value // 2, HISTORY_MAX // 2)
+                for key, value in self.history.items()
+                if value >= 2
+            }
 
         best_move: Optional[chess.Move] = None
         best_score = 0
@@ -949,16 +1203,20 @@ class Engine:
                     else:
                         break
 
-                zkey = chess.polyglot.zobrist_hash(board)
+                zkey = _position_key(board)
                 entry = self.tt_current.get(zkey)
                 if entry is None:
                     entry = self.tt_previous.get(zkey)
-                if entry is not None and entry[3] is not None:
+                if (
+                    entry is not None
+                    and entry[3] is not None
+                    and entry[3] in legal
+                ):
                     best_move = entry[3]
                 best_score = score
                 depth_reached = depth
 
-                if time.time() >= self.stop_time:
+                if time.monotonic() >= self.stop_time:
                     break
                 if abs(score) >= MATE_THRESHOLD:
                     break
@@ -968,7 +1226,7 @@ class Engine:
         if best_move is None:
             best_move = legal[0]
 
-        elapsed = max(1e-6, time.time() - self.start_time)
+        elapsed = max(1e-6, time.monotonic() - self.start_time)
         info = {
             "nodes": self.nodes,
             "nps": int(self.nodes / elapsed),

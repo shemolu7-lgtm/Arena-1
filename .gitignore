@@ -1,0 +1,10 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Test and Cython build artifacts
+.pytest_cache/
+build/
+*.so
+pysharkx.c
